@@ -30,10 +30,10 @@ type CLI struct {
 
 var logger *zap.Logger
 
-// MCPMessage represents a JSON-RPC 2.0 message
+// MCPMessage represents a JSON-RPC 2.0 message with strict validation
 type MCPMessage struct {
 	JSONRPC string      `json:"jsonrpc"`
-	ID      interface{} `json:"id,omitempty"`
+	ID      interface{} `json:"id"`
 	Method  string      `json:"method,omitempty"`
 	Params  interface{} `json:"params,omitempty"`
 	Result  interface{} `json:"result,omitempty"`
@@ -53,7 +53,37 @@ type Proxy struct {
 	tsClient   *local.Client
 	httpClient *http.Client
 	userLogin  string
-	sessionID  string // MCP session ID for streamable HTTP
+	sessionID  string
+}
+
+// createValidResponse creates a properly formatted JSON-RPC 2.0 response
+func createValidResponse(requestID interface{}, result interface{}, err *MCPError) *MCPMessage {
+	// Ensure ID is never null - convert to appropriate type
+	var responseID interface{}
+	if requestID == nil {
+		responseID = 0 // Use 0 instead of null
+	} else {
+		responseID = requestID
+	}
+
+	msg := &MCPMessage{
+		JSONRPC: "2.0",
+		ID:      responseID,
+	}
+
+	if err != nil {
+		msg.Error = err
+		msg.Result = nil
+	} else {
+		msg.Result = result
+		msg.Error = nil
+	}
+
+	// Clear method and params for responses
+	msg.Method = ""
+	msg.Params = nil
+
+	return msg
 }
 
 // initLogger initializes the Zap logger based on environment and debug settings
@@ -157,6 +187,27 @@ func (p *Proxy) Run(ctx context.Context) error {
 	return p.proxyLoop(ctx, serverURL)
 }
 
+// sendResponse sends a JSON-RPC response via stdout
+func (p *Proxy) sendResponse(response *MCPMessage) error {
+	responseBytes, err := json.Marshal(response)
+	if err != nil {
+		logger.Error("Failed to marshal response", zap.Error(err))
+		return err
+	}
+
+	logger.Debug("Sending response", zap.String("response", string(responseBytes)))
+
+	// Write directly to stdout with newline
+	if _, err := os.Stdout.Write(responseBytes); err != nil {
+		return err
+	}
+	if _, err := os.Stdout.Write([]byte("\n")); err != nil {
+		return err
+	}
+	os.Stdout.Sync()
+	return nil
+}
+
 // proxyLoop handles the main proxy loop between stdio and HTTP
 func (p *Proxy) proxyLoop(ctx context.Context, serverURL *url.URL) error {
 	scanner := bufio.NewScanner(os.Stdin)
@@ -176,14 +227,18 @@ func (p *Proxy) proxyLoop(ctx context.Context, serverURL *url.URL) error {
 				zap.Error(err),
 				zap.String("raw_message", line),
 			)
-			p.sendError(nil, -32700, "Parse error", err.Error())
+			errorResponse := createValidResponse(nil, nil, &MCPError{
+				Code:    -32700,
+				Message: "Parse error",
+				Data:    err.Error(),
+			})
+			p.sendResponse(errorResponse)
 			continue
 		}
 
 		logger.Debug("Received MCP message",
 			zap.String("method", msg.Method),
 			zap.Any("id", msg.ID),
-			zap.Any("params", msg.Params),
 		)
 
 		// Forward the message to the remote MCP server
@@ -194,27 +249,20 @@ func (p *Proxy) proxyLoop(ctx context.Context, serverURL *url.URL) error {
 				zap.Any("id", msg.ID),
 				zap.Error(err),
 			)
-			p.sendError(msg.ID, -32603, "Internal error", err.Error())
+			errorResponse := createValidResponse(msg.ID, nil, &MCPError{
+				Code:    -32603,
+				Message: "Internal error",
+				Data:    err.Error(),
+			})
+			p.sendResponse(errorResponse)
 			continue
 		}
 
-		// Send the response back via stdio
-		responseBytes, err := json.Marshal(response)
-		if err != nil {
-			logger.Error("Failed to marshal response",
-				zap.Any("id", msg.ID),
-				zap.Error(err),
-			)
-			p.sendError(msg.ID, -32603, "Internal error", err.Error())
+		// Send the response
+		if err := p.sendResponse(response); err != nil {
+			logger.Error("Failed to send response", zap.Error(err))
 			continue
 		}
-
-		logger.Debug("Sending response",
-			zap.Any("id", msg.ID),
-			zap.String("response", string(responseBytes)),
-		)
-
-		fmt.Println(string(responseBytes))
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -226,7 +274,7 @@ func (p *Proxy) proxyLoop(ctx context.Context, serverURL *url.URL) error {
 	return nil
 }
 
-// forwardMessage forwards an MCP message to the remote server using MCP streamable HTTP protocol
+// forwardMessage forwards an MCP message to the remote server
 func (p *Proxy) forwardMessage(ctx context.Context, serverURL *url.URL, msg *MCPMessage) (*MCPMessage, error) {
 	// Serialize the message
 	msgBytes, err := json.Marshal(msg)
@@ -238,7 +286,6 @@ func (p *Proxy) forwardMessage(ctx context.Context, serverURL *url.URL, msg *MCP
 		zap.String("server", serverURL.String()),
 		zap.String("method", msg.Method),
 		zap.Any("id", msg.ID),
-		zap.String("message", string(msgBytes)),
 	)
 
 	// Create HTTP request
@@ -250,16 +297,12 @@ func (p *Proxy) forwardMessage(ctx context.Context, serverURL *url.URL, msg *MCP
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "MCP-Remote-Proxy/1.0")
 
-	// Add MCP session ID if we have one (for subsequent requests)
+	// Add MCP session ID if we have one
 	if p.sessionID != "" {
 		req.Header.Set("Mcp-Session-Id", p.sessionID)
-		logger.Debug("Using existing session ID", zap.String("session_id", p.sessionID))
 	}
 
-	// Add Tailscale authentication headers for server identification
-	// if the remote server can handle Tailscale auth
-	// this can be used to identify the user and node
-	// and set permissions via Tailscale grants
+	// Add Tailscale authentication headers
 	req.Header.Set("X-Tailscale-User", p.userLogin)
 
 	// Add additional context headers
@@ -275,14 +318,7 @@ func (p *Proxy) forwardMessage(ctx context.Context, serverURL *url.URL, msg *MCP
 				tagSlice = append(tagSlice, tags.At(i))
 			}
 			req.Header.Set("X-Tailscale-Tags", strings.Join(tagSlice, ","))
-
-			logger.Debug("Added Tailscale context",
-				zap.String("node", status.Self.DNSName),
-				zap.Strings("tags", tagSlice),
-			)
 		}
-	} else {
-		logger.Warn("Failed to get Tailscale status for headers", zap.Error(err))
 	}
 
 	// Send the request
@@ -308,13 +344,10 @@ func (p *Proxy) forwardMessage(ctx context.Context, serverURL *url.URL, msg *MCP
 		zap.Duration("duration", duration),
 	)
 
-	// Extract MCP session ID from response headers (for first request or session renewal)
+	// Extract MCP session ID from response headers
 	if sessionID := resp.Header.Get("Mcp-Session-Id"); sessionID != "" {
 		if p.sessionID != sessionID {
-			logger.Info("Received new MCP session ID",
-				zap.String("old_session_id", p.sessionID),
-				zap.String("new_session_id", sessionID),
-			)
+			logger.Info("Received new MCP session ID", zap.String("session_id", sessionID))
 			p.sessionID = sessionID
 		}
 	}
@@ -328,7 +361,6 @@ func (p *Proxy) forwardMessage(ctx context.Context, serverURL *url.URL, msg *MCP
 
 	logger.Debug("Received response",
 		zap.Int("status_code", resp.StatusCode),
-		zap.Int("content_length", len(respBody)),
 		zap.String("response_body", string(respBody)),
 	)
 
@@ -337,7 +369,12 @@ func (p *Proxy) forwardMessage(ctx context.Context, serverURL *url.URL, msg *MCP
 			zap.Int("status_code", resp.StatusCode),
 			zap.String("response_body", string(respBody)),
 		)
-		return nil, fmt.Errorf("server returned status %d: %s", resp.StatusCode, string(respBody))
+		
+		return createValidResponse(msg.ID, nil, &MCPError{
+			Code:    -32603,
+			Message: fmt.Sprintf("Server error (HTTP %d)", resp.StatusCode),
+			Data:    string(respBody),
+		}), nil
 	}
 
 	// Parse the response
@@ -347,83 +384,46 @@ func (p *Proxy) forwardMessage(ctx context.Context, serverURL *url.URL, msg *MCP
 			zap.Error(err),
 			zap.String("response_body", string(respBody)),
 		)
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+		
+		return createValidResponse(msg.ID, nil, &MCPError{
+			Code:    -32700,
+			Message: "Parse error",
+			Data:    fmt.Sprintf("Failed to parse server response: %v", err),
+		}), nil
 	}
 
-	// Handle unsupported method errors gracefully for Claude Desktop compatibility
-	if response.Error != nil && response.Error.Code == -32601 {
-		logger.Info("Converting unsupported method error to empty result",
-			zap.String("method", msg.Method),
-			zap.Int("error_code", response.Error.Code),
-			zap.String("error_message", response.Error.Message),
-		)
+	// Create a clean response with proper validation
+	if response.Error != nil {
+		// Handle unsupported method errors gracefully
+		if response.Error.Code == -32601 {
+			logger.Info("Converting unsupported method error to empty result",
+				zap.String("method", msg.Method),
+			)
 
-		// Convert to successful empty response based on method
-		switch msg.Method {
-		case "prompts/list":
-			response = MCPMessage{
-				JSONRPC: "2.0",
-				ID:      response.ID,
-				Result:  map[string]interface{}{"prompts": []interface{}{}},
-				Error:   nil,
+			// Convert to successful empty response based on method
+			var result interface{}
+			switch msg.Method {
+			case "prompts/list":
+				result = map[string]interface{}{"prompts": []interface{}{}}
+			case "prompts/get":
+				result = map[string]interface{}{"messages": []interface{}{}}
+			case "resources/list":
+				result = map[string]interface{}{"resources": []interface{}{}}
+			case "tools/list":
+				result = map[string]interface{}{"tools": []interface{}{}}
+			default:
+				result = map[string]interface{}{}
 			}
-		case "prompts/get":
-			response = MCPMessage{
-				JSONRPC: "2.0",
-				ID:      response.ID,
-				Result:  map[string]interface{}{"messages": []interface{}{}},
-				Error:   nil,
-			}
-		default:
-			// For other unsupported methods, return empty result
-			response = MCPMessage{
-				JSONRPC: "2.0",
-				ID:      response.ID,
-				Result:  map[string]interface{}{},
-				Error:   nil,
-			}
+
+			return createValidResponse(msg.ID, result, nil), nil
 		}
 
-		logger.Debug("Converted error response to success",
-			zap.String("method", msg.Method),
-			zap.Any("result", response.Result),
-		)
+		// Return the error response
+		return createValidResponse(msg.ID, nil, response.Error), nil
 	}
 
-	return &response, nil
-}
-
-// sendError sends an error response via stdio
-func (p *Proxy) sendError(id interface{}, code int, message, data string) {
-	errorMsg := MCPMessage{
-		JSONRPC: "2.0",
-		ID:      id,
-		Error: &MCPError{
-			Code:    code,
-			Message: message,
-			Data:    data,
-		},
-	}
-
-	errorBytes, err := json.Marshal(errorMsg)
-	if err != nil {
-		logger.Error("Failed to marshal error response",
-			zap.Error(err),
-			zap.Any("id", id),
-			zap.Int("code", code),
-			zap.String("message", message),
-		)
-		return
-	}
-
-	logger.Warn("Sending error response",
-		zap.Any("id", id),
-		zap.Int("code", code),
-		zap.String("message", message),
-		zap.String("data", data),
-	)
-
-	fmt.Println(string(errorBytes))
+	// Return the success response
+	return createValidResponse(msg.ID, response.Result, nil), nil
 }
 
 func main() {
